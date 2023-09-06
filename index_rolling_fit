@@ -1,0 +1,257 @@
+def rolling_prediction(dataframe, train_size, test_size, model):
+
+        # """
+        #
+        # 在我们的上下文中，for start in range(0, len(df) - train_size, test_size):的意思是：
+        #
+        # start: 从0开始。
+        # stop: 到len(df) - train_size结束。这是为了确保在最后一个训练窗口中有足够的数据进行预测。
+        # step: 每次增加test_size。这意味着start的值将是0、test_size、2*test_size...，直到len(df) - train_size。
+        # 这样，我们的循环会在每次迭代中移动test_size行，然后使用train_size行数据进行训练，并预测接下来的test_size行数据。
+        #
+        # 例如，如果df有50行，train_size是20，test_size是10，那么：
+        # 第一次迭代：start为0，使用1-20行数据预测21-30行。
+        # 第二次迭代：start为10，使用11-30行数据预测31-40行。
+        # 第三次迭代：start为20，使用21-40行数据预测41-50行。
+        # """
+
+    # 创建一个新列并初始化为NaN
+    dataframe['predictions'] = None
+
+    # 数据标准化
+    scaler = StandardScaler()
+    features = dataframe.drop(columns=['next_day_return_label', 'predictions'])
+    dataframe[features.columns] = scaler.fit_transform(features)
+
+    for start in range(0, len(dataframe) - train_size, test_size):
+        # 打印正在处理的时间段
+        start_date = dataframe.index[start]
+        end_date = dataframe.index[min(start+train_size+test_size-1, len(dataframe)-1)]
+        print(f"正在预测： {start_date} 到 {end_date}")
+
+        # 训练数据
+        X_train = dataframe.drop(columns=['next_day_return_label', 'predictions']).iloc[start:start+train_size]
+        y_train = dataframe['next_day_return_label'].iloc[start:start+train_size].ravel()
+
+        model.fit(X_train, y_train)
+
+        # 预测数据
+        X_test = dataframe.drop(columns=['next_day_return_label', 'predictions']).iloc[start+train_size:start+train_size+test_size]
+        predictions = model.predict(X_test)
+
+        # 将预测值填入新列
+        dataframe.loc[dataframe.index[start+train_size:start+train_size+test_size], 'predictions'] = predictions
+
+    return dataframe
+
+def acc_report(predictions, actuals):
+    from sklearn.metrics import accuracy_score
+
+    # 删除包含NaN的行
+    valid_indices = predictions.dropna().index
+    predictions = predictions.loc[valid_indices]
+    actuals = actuals.loc[valid_indices]
+
+    # 确保两个Series都是整数类型
+    predictions = predictions.astype(int)
+    actuals = actuals.astype(int)
+
+    # 计算准确率
+    accuracy = accuracy_score(actuals, predictions)
+
+    # 计算差值
+    difference = abs(predictions - actuals)
+
+    # 计算差值为2的比例
+    wrong_pred_prop = (difference == 2).mean()
+
+    # 计算prediction为0但actual不为0的比例
+    pred_zero_actual_not = ((predictions == 0) & (actuals != 0)).mean()
+
+    # 计算actual为0但prediction不为0的比例
+    actual_zero_pred_not = ((predictions != 0) & (actuals == 0)).mean()
+
+    trading_acc = accuracy / (accuracy + wrong_pred_prop)
+
+    return accuracy, wrong_pred_prop, pred_zero_actual_not, actual_zero_pred_not, trading_acc
+
+
+
+
+class MyCommInfo(bt.CommInfoBase):
+    params = (
+        ("stocklike", False),
+        ("commtype", bt.CommInfoBase.COMM_PERC),  # 按比例收取手续费
+        ("percabs", False),
+        ("commission", 0.0023),  # 手续费按照比例0.0023
+        ('mult', 300),
+    )
+
+    def _getcommission(self, size, price, pseudoexec):
+        """
+        计算交易手续费和佣金
+        """
+        # 手续费 = 交易金额 * 手续费比例
+        commission = abs(size) * price * self.p.commission * self.p.mult
+        # 佣金 = 固定佣金
+        # 总成本 = 手续费 + 佣金
+        total_cost = commission
+        return total_cost
+
+
+class MyData(bt.feeds.PandasData):
+
+    lines = ('prediction', )
+    params = (('prediction', -1),)
+
+    pass
+
+
+class MyStrategy(bt.Strategy):
+
+
+    def log(self, txt, dt=None):
+        '''日志函数'''
+        dt = dt or self.datas[0].datetime.datetime(0)
+        dt_str = dt.strftime('%Y-%m-%d %H:%M:%S')  # 格式化日期和时间
+        print('%s, %s' % (dt_str, txt))
+
+    def notify_order(self, order):
+        '''订单状态更新'''
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            cost = order.executed.price * order.executed.size  # 计算成本
+            if order.isbuy():
+                self.log(f"买入: 价格 {order.executed.price:.2f}, 成本 {cost:.2f}, 手续费 {order.executed.comm:.2f}, 手数 {order.executed.size}")
+            else:
+                self.log(f"卖出: 价格 {order.executed.price:.2f}, 成本 {cost:.2f}, 手续费 {order.executed.comm:.2f}, 手数 {order.executed.size}")
+
+            self.bar_executed = len(self)
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.log('订单状态 %s' % order.status)
+
+        self.order = None
+
+    def notify_trade(self, trade):
+        if not trade.isclosed:
+            return
+
+        size = abs(trade.size)  # 获取交易的绝对值手数，考虑买入和卖出的情况
+        cost = trade.price * trade.size  # 计算交易的成本
+
+        self.log(f"交易利润: 毛利润 {trade.pnl:.2f}, 净利润 {trade.pnlcomm:.2f}, 手数 {size}, 成本 {cost:.2f}")
+
+
+
+
+
+
+    params = (
+        ('margin',1),  # 保证金比例
+        ('max_pos',0.9),
+        ('mult', 300),
+        ('stop_loss_atr_long', 2.5 ),
+        ('stop_loss_atr_short', 2.5)
+
+    )
+    def __init__(self):
+
+
+        self.prediction = self.data.prediction  # 输入prediction
+
+        self.holding_highest_price = None  # 持仓时最高价
+        self.holding_lowest_price = None  # 持仓时最低价
+
+
+        # 技术指标模块
+        self.atr = bt.indicators.AverageTrueRange(self.data, )    # 止损用 atr指标
+
+
+    def next(self):
+        cash = self.broker.get_cash()
+        max_size = int(cash * self.params.max_pos / self.datas[0].close[0] / self.params.margin / self.params.mult)
+        close_price = self.datas[0].close[0]
+        high_price = self.datas[0].high[0]
+        low_price = self.datas[0].low[0]
+        current_datetime = self.datas[0].datetime.datetime()
+
+
+        # print(current_datetime, '当前价格=',close_price,  '当前现金=', cash, '当前持仓=' , self.position.size, '持仓最高价格=', self.holding_highest_price, '持仓最低价格=', self.holding_lowest_price,'最多交易=', max_size, '预测值=', self.prediction[0])
+
+        # 开多
+        if not self.position:
+
+
+            # 每天下午两点半判断开仓
+            if current_datetime.time() == datetime.time(14, 30):
+                # 预测上涨， 开多
+                if self.prediction[0] == 1:
+                    self.buy(size=max_size)
+                # 预测下跌， 开空
+                if self.prediction[0] == -1:
+                    self.sell(size=max_size)
+
+            self.holding_highest_price = None
+            self.holding_lowest_price = None
+
+
+                        # 平多的条件
+        # 当前时间
+        current_time = current_datetime.time()
+
+        # 平多的条件
+        if self.position.size > 0:
+
+            # 如果是新的多头仓位，设置当前价格为最高价
+            if self.holding_highest_price is None:
+                self.holding_highest_price = high_price
+            else:
+                # 更新持有多头时的最高价
+                self.holding_highest_price = max(self.holding_highest_price, high_price)
+
+            stop_loss_long = self.holding_highest_price - self.p.stop_loss_atr_long * self.atr[0]
+
+
+            if close_price < stop_loss_long:
+                self.close()
+
+
+
+            # 在14:30根据预测进行操作
+            if current_time == datetime.time(14, 00):
+
+                if self.prediction[0] == -1:
+                    self.close()
+
+                if self.prediction[0] == 0:
+                    self.close(size=(self.position.size / 1.5))
+
+
+
+        # 平空的条件
+        if self.position.size < 0:
+
+            if self.holding_lowest_price is None:
+                self.holding_lowest_price = low_price
+            else:
+                # 更新持有空头时的最低价格
+                self.holding_lowest_price = min(self.holding_lowest_price, low_price)
+
+
+            stop_loss_short = self.holding_lowest_price + self.p.stop_loss_atr_short * self.atr[0]
+
+            if close_price > stop_loss_short:
+                self.close()
+
+
+            if current_time == datetime.time(14, 00):
+                if self.prediction[0] == 1:
+                    self.close()
+                if self.prediction[0] == 0:
+                    self.close(size=(self.position.size / 1.5))
+
+
+    
